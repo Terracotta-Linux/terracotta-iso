@@ -1,0 +1,24 @@
+base
+cloud-init
+hyperv
+linux
+linux-firmware
+mkinitcpio
+mkinitcpio-archiso
+open-vm-tools
+openssh
+pv
+qemu-guest-agent
+virtualbox-guest-utils-nox
+
+# Terracotta Linux additions
+grub
+efibootmgr
+dosfstools
+networkmanager
+plymouth
+terracotta-kiln
+terracotta-installer
+terracotta-branding
+terracotta-branding-plymouth
+terracotta-branding-wallpapers
