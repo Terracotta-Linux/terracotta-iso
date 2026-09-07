@@ -1,0 +1,61 @@
+name: Daily update check
+
+# Checks whether any *important* Terracotta package (kernel, firmware,
+# bootloader, Kiln, ...) has a newer upstream version than what's in the
+# latest published ISO release. Ordinary dependency updates are tracked for
+# visibility only and never trigger a release on their own.
+#
+# The important/ordinary distinction lives in .github/important-packages.json
+# and is resolved by .github/scripts/package_versions.py, shared with
+# release-iso.yml so there is exactly one place that decides "important".
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
+
+# Only one check should run at a time; a manual run shouldn't race a
+# scheduled one and risk firing the release trigger twice for the same delta.
+concurrency:
+  group: daily-update-check
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # Needed to trigger release-iso.yml's workflow_dispatch via `gh workflow run`.
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check important package versions
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/package_versions.py diff
+
+      - name: Trigger ISO release workflow
+        if: steps.check.outputs.has_important_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMPORTANT_UPDATES_JSON: ${{ steps.check.outputs.important_updates_json }}
+        run: |
+          echo "Important package update(s) detected - triggering release-iso.yml"
+          echo "${IMPORTANT_UPDATES_JSON}"
+
+          # Base64-encode so the JSON payload can't interfere with -f value
+          # parsing or shell quoting on the way through workflow_dispatch inputs.
+          encoded="$(printf '%s' "${IMPORTANT_UPDATES_JSON}" | base64 -w0)"
+
+          gh workflow run release-iso.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f important_updates_b64="${encoded}"
+
+      - name: No important update
+        if: steps.check.outputs.has_important_update != 'true'
+        run: echo "No important-package updates found - not triggering a release."

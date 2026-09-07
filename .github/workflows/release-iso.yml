@@ -1,0 +1,205 @@
+name: Build and release ISO
+
+# Builds the Terracotta Linux ISO with the repo's existing mkarchiso-based
+# build system (build.sh), validates it, checksums it, and publishes a
+# GitHub release. Runs either:
+#
+#   - Triggered by daily-update-check.yml, with `important_updates_b64` set
+#     to a base64-encoded JSON array of important-package changes; or
+#   - Manually via workflow_dispatch with no input, for an ordinary on-demand
+#     build using whatever is currently latest upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      important_updates_b64:
+        description: >-
+          Base64-encoded JSON array of important package updates
+          ({name,label,old,new}), set by daily-update-check.yml. Leave blank
+          for a manual release.
+        required: false
+        default: ''
+
+# Serialize releases: never run two ISO builds at once, and never let a
+# second trigger for the same update race the first release before it's
+# published (the guard job below re-checks against the *published* release,
+# so queuing here is what makes that re-check reliable).
+concurrency:
+  group: iso-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+      important_updates_json: ${{ steps.decide.outputs.important_updates_json }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide whether to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMPORTANT_UPDATES_B64: ${{ inputs.important_updates_b64 }}
+        run: |
+          if [[ -z "${IMPORTANT_UPDATES_B64}" ]]; then
+            echo "Manual trigger with no update payload - building unconditionally."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "important_updates_json=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          json="$(printf '%s' "${IMPORTANT_UPDATES_B64}" | base64 -d)"
+          {
+            echo "important_updates_json<<EOF_UPDATES"
+            echo "${json}"
+            echo "EOF_UPDATES"
+          } >> "$GITHUB_OUTPUT"
+
+          # Re-verify against the *currently published* release right before
+          # building. If another run already shipped this exact delta (e.g.
+          # the daily checker fired twice, or ran again while a build was
+          # queued behind this one), there's nothing left to release.
+          python3 .github/scripts/package_versions.py diff > /tmp/diff.json
+          has_update="$(jq -r '.has_important_update' /tmp/diff.json)"
+          if [[ "${has_update}" != "true" ]]; then
+            echo "Latest published release already ships these versions - skipping duplicate build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: guard
+    if: needs.guard.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    # mkarchiso needs an Arch Linux userspace (archiso, pacstrap, etc.) and
+    # privileged mounts/loop devices to build the airootfs and squashfs.
+    container:
+      image: archlinux:base-devel
+      options: --privileged
+    steps:
+      - name: Install build tooling
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring
+          # grub is needed on the build host itself: mkarchiso shells out to
+          # grub-install to build the UEFI GRUB boot images (it's otherwise
+          # only listed in profile/packages.x86_64 for the ISO's own
+          # contents, which doesn't help the host doing the building).
+          pacman -Su --noconfirm --needed archiso grub libarchive file github-cli git jq python sudo
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Trust workspace (container runs as root, different UID than the runner)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Compute build date / ISO version
+        id: version
+        run: |
+          # SOURCE_DATE_EPOCH drives profile/profiledef.sh's iso_version; pin
+          # it once here so the ISO's embedded version and the release tag
+          # we create below are guaranteed to match.
+          epoch="$(date +%s)"
+          echo "SOURCE_DATE_EPOCH=${epoch}" >> "$GITHUB_ENV"
+          echo "iso_version=$(date --date="@${epoch}" +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Build ISO
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./build.sh
+
+      - name: Validate ISO
+        id: validate
+        run: |
+          iso_path="$(find out -maxdepth 1 -name '*.iso' -printf '%T@ %p\n' | sort -rn | head -n1 | cut -d' ' -f2-)"
+          if [[ -z "${iso_path}" ]]; then
+            echo "::error::No ISO produced in out/"
+            exit 1
+          fi
+          echo "iso_path=${iso_path}" >> "$GITHUB_OUTPUT"
+
+          size_bytes="$(stat -c '%s' "${iso_path}")"
+          echo "==> ISO size: ${size_bytes} bytes"
+          if (( size_bytes < 200*1000*1000 )); then
+            echo "::error::ISO is suspiciously small (${size_bytes} bytes) - likely a broken build"
+            exit 1
+          fi
+
+          file_output="$(file -b "${iso_path}")"
+          echo "==> file(1): ${file_output}"
+          if [[ "${file_output}" != *"ISO 9660"* ]]; then
+            echo "::error::Output does not look like an ISO 9660 image: ${file_output}"
+            exit 1
+          fi
+          # profiledef.sh configures only UEFI bootmodes (no BIOS/syslinux),
+          # so file(1) reporting an El Torito boot catalog here can only mean
+          # the UEFI one - a much more reliable signal than guessing at
+          # mkarchiso's internal EFI file layout (which varies by archiso
+          # version: sometimes a plain /EFI/BOOT/*.EFI, sometimes packed
+          # inside a FAT-formatted ESP image file).
+          if [[ "${file_output}" != *"bootable"* ]]; then
+            echo "::error::ISO has no El Torito boot catalog (file(1) did not report 'bootable'): ${file_output}"
+            exit 1
+          fi
+
+          # profile/profiledef.sh sets install_dir="terracotta"; mkarchiso
+          # lays out the airootfs/kernel under that top-level directory.
+          # bsdtar (libarchive) reads the ISO9660 tree directly, no mount
+          # or root privileges needed.
+          if ! bsdtar -tf "${iso_path}" | grep -q '^terracotta/'; then
+            echo "::error::ISO is missing expected terracotta/ install directory"
+            exit 1
+          fi
+
+          echo "==> ISO validation passed"
+
+      - name: Generate checksum
+        id: checksum
+        run: |
+          iso_path="${{ steps.validate.outputs.iso_path }}"
+          iso_dir="$(dirname "${iso_path}")"
+          iso_file="$(basename "${iso_path}")"
+          (cd "${iso_dir}" && sha256sum "${iso_file}" > "${iso_file}.sha256")
+          echo "checksum_path=${iso_path}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Snapshot shipped package versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISO_VERSION: ${{ steps.version.outputs.iso_version }}
+        run: python3 .github/scripts/package_versions.py snapshot > out/versions.json
+
+      - name: Render release notes
+        env:
+          ISO_VERSION: ${{ steps.version.outputs.iso_version }}
+          IMPORTANT_UPDATES_JSON: ${{ needs.guard.outputs.important_updates_json }}
+        run: python3 .github/scripts/render_release_notes.py "${IMPORTANT_UPDATES_JSON}" > /tmp/release-notes.md
+
+      - name: Determine release tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ steps.version.outputs.iso_version }}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            # Same-day release already exists (e.g. a manual build ran after
+            # today's automatic one) - disambiguate instead of failing.
+            tag="${tag}-run${GITHUB_RUN_NUMBER}"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --title "Terracotta Linux ${{ steps.version.outputs.iso_version }}" \
+            --notes-file /tmp/release-notes.md \
+            "${{ steps.validate.outputs.iso_path }}" \
+            "${{ steps.checksum.outputs.checksum_path }}" \
+            out/versions.json

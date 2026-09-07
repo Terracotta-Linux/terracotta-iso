@@ -1,0 +1,48 @@
+{
+  "$comment": "Single source of truth for which packages are 'important' to Terracotta Linux, i.e. an update to any of them warrants a new ISO release. Read by .github/scripts/package_versions.py and used by both the daily update-check workflow and the release workflow. Everything else in profile/packages.x86_64 is treated as an ordinary dependency: it may be tracked for visibility but must never by itself trigger a release.",
+  "packages": [
+    {
+      "name": "linux",
+      "label": "Linux kernel",
+      "source": "archlinux"
+    },
+    {
+      "name": "linux-firmware",
+      "label": "Linux firmware",
+      "source": "archlinux"
+    },
+    {
+      "name": "mkinitcpio",
+      "label": "mkinitcpio (initramfs generator)",
+      "source": "archlinux"
+    },
+    {
+      "name": "mkinitcpio-archiso",
+      "label": "mkinitcpio-archiso (live-boot hooks)",
+      "source": "archlinux"
+    },
+    {
+      "name": "grub",
+      "label": "GRUB bootloader",
+      "source": "archlinux"
+    },
+    {
+      "name": "terracotta-kiln",
+      "label": "Kiln",
+      "source": "github-release",
+      "github_repo": "Terracotta-Linux/kiln"
+    },
+    {
+      "name": "terracotta-installer",
+      "label": "Terracotta Installer",
+      "source": "github-release",
+      "github_repo": "Terracotta-Linux/terracotta-installer"
+    },
+    {
+      "name": "terracotta-branding",
+      "label": "Terracotta Branding",
+      "source": "github-release",
+      "github_repo": "Terracotta-Linux/terracotta-branding"
+    }
+  ]
+}
