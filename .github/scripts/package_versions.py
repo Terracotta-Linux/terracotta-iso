@@ -94,11 +94,15 @@ def shipped_versions():
     if not this_repo:
         return {}
     try:
+        # `gh release view latest` has proven unreliable (it can report
+        # "release not found" even when the API's own /releases/latest
+        # correctly resolves one) - go straight through the REST API instead.
         tag = subprocess.run(
-            ["gh", "release", "view", "latest", "-R", this_repo, "--json", "tagName", "-q", ".tagName"],
+            ["gh", "api", f"repos/{this_repo}/releases/latest", "--jq", ".tag_name"],
             check=True, capture_output=True, text=True,
         ).stdout.strip()
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
+        print(f"warning: failed to determine latest release for {this_repo}: {exc.stderr.strip()}", file=sys.stderr)
         return {}
     if not tag:
         return {}
